@@ -14,9 +14,10 @@ layout ``discover_trip_files`` / ``discover_status_files`` already read.
 
 A month that is already on disk is left untouched.
 
-``ensure_status_files`` is the status-only counterpart used by the
-infrastructure notebook. It fetches station snapshots and leaves trip
-archives on the server.
+``ensure_status_files`` fetches station snapshots and leaves trip archives
+on the server. ``ensure_trip_files`` fetches trip files and leaves status
+archives on the server. A file of the requested kind that is already on
+disk is left as it is.
 """
 
 from __future__ import annotations
@@ -150,6 +151,43 @@ def ensure_status_files(cfg: ProjectConfig) -> pd.DataFrame:
                     "year": year,
                     "month": str(year),
                     "kind": "status",
+                    "file": "",
+                    "bytes": 0,
+                    "action": "not published",
+                }
+            )
+            continue
+        rows.extend(got)
+    frame = _frame(rows)
+    if not unpublished:
+        return frame
+    extra = pd.DataFrame(unpublished, columns=_REPORT_COLUMNS)
+    return pd.concat([frame, extra], ignore_index=True)
+
+
+def ensure_trip_files(cfg: ProjectConfig) -> pd.DataFrame:
+    """Download every trip member of the EMT yearly archives.
+
+    Status members are not fetched. A trip file already on disk is left as it
+    is. A year whose archive contains no trip member is one row with action
+    ``not published``.
+    """
+    cfg.trips_raw.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(cfg.trips_raw).free
+    print(f"free disk before trip download: {free / 1e9:.1f} GB", flush=True)
+    resources = fetch_year_resources()
+    rows: list[dict] = []
+    seen: dict[str, set[str]] = {"trips": set(), "status": set()}
+    unpublished: list[dict] = []
+    for year in sorted(resources):
+        got = _acquire_year(cfg, year, resources[year], None, seen, kinds={"trips"})
+        if not got:
+            print(f"EMT {year}: archive has no trip files.", flush=True)
+            unpublished.append(
+                {
+                    "year": year,
+                    "month": str(year),
+                    "kind": "trips",
                     "file": "",
                     "bytes": 0,
                     "action": "not published",

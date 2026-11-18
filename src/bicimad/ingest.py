@@ -177,6 +177,269 @@ def parse_trips_file(path: Path) -> pd.DataFrame:
     return parse_trips_json_file(path, schema)
 
 
+def trip_intervals(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Start and end times for trips that have both.
+
+    The integers use the same unit as ``Series.astype("int64")`` on a UTC
+    timestamp, so they compare directly with status snapshot times. The GPS
+    ``track`` is dropped before the trip is kept. A trip with no end, or with
+    an end at or before the start, is omitted. The two arrays are paired and
+    unsorted.
+    """
+    schema = trip_schema_for(path)
+    if schema == "csv":
+        starts, ends = _csv_intervals(path)
+    else:
+        starts, ends = _json_intervals(path)
+    if starts.size == 0:
+        raise RuntimeError(f"{path.name} contained no trips with a start and an end")
+    return starts, ends
+
+
+def count_trips_in_progress(
+    snapshot_ns: np.ndarray,
+    start_ns: np.ndarray,
+    end_ns: np.ndarray,
+) -> np.ndarray:
+    """Count trips with ``start <= t < end`` at each snapshot.
+
+    Starts and ends are sorted once and scanned in time order. The result
+    follows the order of ``snapshot_ns``.
+    """
+    snaps = np.asarray(snapshot_ns, dtype=np.int64)
+    if snaps.size == 0:
+        return np.array([], dtype=np.int64)
+    order = np.argsort(snaps, kind="mergesort")
+    ordered = snaps[order]
+    starts = np.sort(np.asarray(start_ns, dtype=np.int64))
+    ends = np.sort(np.asarray(end_ns, dtype=np.int64))
+    started = np.searchsorted(starts, ordered, side="right")
+    finished = np.searchsorted(ends, ordered, side="right")
+    counted = started - finished
+    if np.any(counted < 0):
+        raise RuntimeError("in-progress trip count went negative")
+    out = np.empty(snaps.shape, dtype=np.int64)
+    out[order] = counted
+    return out
+
+
+def _csv_intervals(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    header = _csv_header_line(path)
+    if _csv_has_interval_columns(header):
+        frame = _read_interval_columns(path, sep=";")
+    else:
+        stripped = header.replace(";", "")
+        if not _csv_has_interval_columns(stripped):
+            raise RuntimeError(f"{path.name} is missing columns: ['lock_date', 'unlock_date']")
+        return _intervals_from_damaged_csv(path)
+    start = pd.to_datetime(frame["unlock_date"], utc=True, errors="coerce")
+    end = pd.to_datetime(frame["lock_date"], utc=True, errors="coerce")
+    ok = start.notna() & end.notna() & end.gt(start)
+    return (
+        start.loc[ok].astype("int64").to_numpy(),
+        end.loc[ok].astype("int64").to_numpy(),
+    )
+
+
+_ISO_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _intervals_from_damaged_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """October 2021 is published with semicolons and quotes inside fields.
+
+    After the inserted semicolons are removed, each intact row carries three
+    timestamps: the lock time inside the trip id, then ``unlock_date``, then
+    ``lock_date``. The last two are the interval.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace").replace(";", "")
+    unlocks: list[str] = []
+    locks: list[str] = []
+    for line in text.splitlines():
+        found = _ISO_STAMP.findall(line)
+        if len(found) < 2:
+            continue
+        unlocks.append(found[-2])
+        locks.append(found[-1])
+    start = pd.to_datetime(pd.Series(unlocks), utc=True, errors="coerce")
+    end = pd.to_datetime(pd.Series(locks), utc=True, errors="coerce")
+    ok = start.notna() & end.notna() & end.gt(start)
+    return (
+        start[ok].astype("int64").to_numpy(),
+        end[ok].astype("int64").to_numpy(),
+    )
+
+
+def _csv_header_line(path: Path) -> str:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return handle.readline()
+
+
+def _csv_has_interval_columns(header: str) -> bool:
+    return "unlock_date" in header and "lock_date" in header
+
+
+def _read_interval_columns(path: Path, sep: str) -> pd.DataFrame:
+    return pd.read_csv(
+        path,
+        sep=sep,
+        usecols=["unlock_date", "lock_date"],
+        dtype=str,
+        encoding="utf-8",
+        encoding_errors="replace",
+        low_memory=False,
+    )
+
+
+def _json_intervals(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    stamps: list[str] = []
+    seconds: list[float] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_no, raw in enumerate(handle, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("\ufeff"):
+                line = line.lstrip("\ufeff")
+            try:
+                obj = _loads_trip_line(line) if '"track"' in line else json.loads(line)
+            except (json.JSONDecodeError, RuntimeError) as exc:
+                raise RuntimeError(f"{path.name} line {line_no} is not a trip record") from exc
+            if not isinstance(obj, dict):
+                raise RuntimeError(f"{path.name} line {line_no} is not a trip record")
+            raw_time = obj.get("unplug_hourTime")
+            if isinstance(raw_time, dict):
+                raw_time = raw_time.get("$date")
+            if raw_time is None:
+                continue
+            travel = obj.get("travel_time")
+            try:
+                duration = float(travel)
+            except (TypeError, ValueError):
+                continue
+            if not duration > 0:
+                continue
+            stamps.append(str(raw_time))
+            seconds.append(duration)
+            if len(stamps) % 250_000 == 0:
+                print(f"  {path.name}: {len(stamps):,} trips", flush=True)
+    if not stamps:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    normalized = pd.Series(stamps).str.replace(
+        r"([+-]\d{2})(\d{2})$", r"\1:\2", regex=True
+    )
+    start = pd.to_datetime(normalized, utc=True, errors="coerce")
+    duration_s = np.asarray(seconds, dtype=np.float64)
+    ok = start.notna().to_numpy()
+    start_ns = start.loc[ok].astype("int64").to_numpy()
+    end_ns = start_ns + np.round(duration_s[ok] * _datetime_int_scale(start.dtype)).astype(
+        np.int64
+    )
+    return start_ns, end_ns
+
+
+def _datetime_int_scale(dtype) -> int:
+    """Seconds-to-integer factor for the unit of a pandas datetime dtype."""
+    unit = getattr(dtype, "unit", "ns")
+    scale = {"ns": 1_000_000_000, "us": 1_000_000, "ms": 1_000, "s": 1}
+    try:
+        return scale[unit]
+    except KeyError as exc:
+        raise RuntimeError(f"Unsupported datetime unit {unit}") from exc
+
+
+def _loads_trip_line(line: str) -> dict:
+    """Parse one trip, dropping the GPS track before it is kept."""
+    payload = line
+    if '"track"' in line:
+        try:
+            payload = _drop_json_field(line, "track")
+        except RuntimeError:
+            payload = line
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        if payload is line:
+            raise
+        obj = json.loads(line)
+    if isinstance(obj, dict):
+        obj.pop("track", None)
+    return obj
+
+
+def _drop_json_field(text: str, field: str) -> str:
+    """Remove the first JSON field named ``field``, including its value."""
+    needle = f'"{field}"'
+    start = text.find(needle)
+    if start < 0:
+        return text
+    index = start + len(needle)
+    length = len(text)
+    while index < length and text[index].isspace():
+        index += 1
+    if index >= length or text[index] != ":":
+        return text
+    index += 1
+    while index < length and text[index].isspace():
+        index += 1
+    value_end = _skip_json_value(text, index)
+    right = value_end
+    cursor = value_end
+    while cursor < length and text[cursor].isspace():
+        cursor += 1
+    if cursor < length and text[cursor] == ",":
+        right = cursor + 1
+        left = start
+    else:
+        left = start
+        comma = start - 1
+        while comma >= 0 and text[comma].isspace():
+            comma -= 1
+        if comma >= 0 and text[comma] == ",":
+            left = comma
+    return text[:left] + text[right:]
+
+
+def _skip_json_value(text: str, index: int) -> int:
+    length = len(text)
+    if index >= length:
+        raise RuntimeError("JSON value is missing")
+    char = text[index]
+    if char == '"':
+        return _skip_json_string(text, index)
+    if char in "{[":
+        depth = 0
+        while index < length:
+            current = text[index]
+            if current == '"':
+                index = _skip_json_string(text, index)
+                continue
+            if current in "{[":
+                depth += 1
+            elif current in "}]":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        raise RuntimeError("unterminated JSON value")
+    while index < length and text[index] not in ",}]":
+        index += 1
+    return index
+
+
+def _skip_json_string(text: str, index: int) -> int:
+    index += 1
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == '"':
+            return index + 1
+        index += 1
+    raise RuntimeError("unterminated JSON string")
+
+
 def parse_status_file(path: Path) -> pd.DataFrame:
     rows: list[dict] = []
     with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -309,6 +572,65 @@ def snapshot_station_counts(path: Path) -> pd.DataFrame:
     if missing_ts:
         raise RuntimeError(f"{path.name} has {missing_ts} snapshots without a timestamp")
     return frame
+
+
+def snapshot_docked_bikes(path: Path) -> pd.DataFrame:
+    """One row per status snapshot in ``path``.
+
+    ``n_docked`` sums ``dock_bikes`` over every listed station, including
+    stations marked unavailable. A missing or non-numeric ``dock_bikes``
+    counts as zero.
+    """
+    rows: list[dict] = []
+    for obj in _iter_status_snapshots(path):
+        rows.append(
+            {
+                "ts": _to_utc_datetime(obj.get("_id")),
+                "n_docked": _sum_dock_bikes(obj.get("stations"), path),
+            }
+        )
+    if not rows:
+        raise RuntimeError(f"{path.name} contained no station snapshots")
+    frame = pd.DataFrame(rows)
+    frame["n_docked"] = frame["n_docked"].astype("int64")
+    frame["ts"] = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
+    missing_ts = int(frame["ts"].isna().sum())
+    if missing_ts:
+        raise RuntimeError(f"{path.name} has {missing_ts} snapshots without a timestamp")
+    return frame
+
+
+def _sum_dock_bikes(stations, path: Path) -> int:
+    if not isinstance(stations, list):
+        raise RuntimeError(f"{path.name} has a snapshot whose stations field is not a list")
+    total = 0
+    for station in stations:
+        if isinstance(station, dict):
+            total += _dock_bikes_value(station.get("dock_bikes"))
+    return total
+
+
+def _dock_bikes_value(value) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return 0
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        try:
+            number = float(text)
+        except ValueError:
+            return 0
+        if number != number:
+            return 0
+        return int(number)
+    return 0
 
 
 def load_snapshot_station_counts(cfg: ProjectConfig) -> pd.DataFrame:
