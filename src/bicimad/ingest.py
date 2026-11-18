@@ -276,3 +276,182 @@ def hourly_bin(ts: pd.Series) -> pd.Series:
     naive = madrid.dt.tz_localize(None)
     floored = naive.dt.floor("h")
     return floored.dt.tz_localize(MADRID_TZ, ambiguous=True, nonexistent="shift_forward")
+
+
+_COUNT_CACHE = "snapshot_station_counts.parquet"
+_COUNT_MANIFEST = "snapshot_station_counts.manifest.json"
+
+
+def snapshot_station_counts(path: Path) -> pd.DataFrame:
+    """One row per status snapshot in ``path``.
+
+    ``n_stations`` is the number of distinct station ids listed in the snapshot.
+    ``n_active`` counts those with ``activate == 1``. When a snapshot never
+    carries an ``activate`` field, ``n_active`` is missing for that row.
+    """
+    rows: list[dict] = []
+    for obj in _iter_status_snapshots(path):
+        n_stations, n_active = _count_listed_stations(obj.get("stations"), path)
+        rows.append(
+            {
+                "ts": _to_utc_datetime(obj.get("_id")),
+                "n_stations": n_stations,
+                "n_active": n_active,
+            }
+        )
+    if not rows:
+        raise RuntimeError(f"{path.name} contained no station snapshots")
+    frame = pd.DataFrame(rows)
+    frame["n_stations"] = frame["n_stations"].astype("Int64")
+    frame["n_active"] = pd.array(frame["n_active"], dtype="Int64")
+    frame["ts"] = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
+    missing_ts = int(frame["ts"].isna().sum())
+    if missing_ts:
+        raise RuntimeError(f"{path.name} has {missing_ts} snapshots without a timestamp")
+    return frame
+
+
+def load_snapshot_station_counts(cfg: ProjectConfig) -> pd.DataFrame:
+    """Station counts for every status file under ``cfg``.
+
+    The result is cached at ``data/processed/infrastructure``. A later call
+    reuses the cache when the status filenames and sizes are unchanged, and
+    rescans otherwise.
+    """
+    folder = cfg.processed_dir / "infrastructure"
+    cache = folder / _COUNT_CACHE
+    manifest_path = folder / _COUNT_MANIFEST
+    manifest = _status_manifest(cfg)
+    if not manifest:
+        raise RuntimeError(f"No status files in {cfg.status_raw}")
+    if cache.is_file() and manifest_path.is_file():
+        saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if saved == manifest:
+            return pd.read_parquet(cache)
+    files = discover_status_files(cfg)
+    frames: list[pd.DataFrame] = []
+    for month, path in files.items():
+        print(f"counting stations in {path.name}", flush=True)
+        frame = snapshot_station_counts(path)
+        frame["month"] = month
+        frame["source_file"] = path.name
+        frames.append(frame)
+    out = pd.concat(frames, ignore_index=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(cache, index=False)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return out
+
+
+def _status_manifest(cfg: ProjectConfig) -> list[dict]:
+    return [
+        {"month": month, "file": path.name, "bytes": path.stat().st_size}
+        for month, path in discover_status_files(cfg).items()
+    ]
+
+
+_MONGO_NUMBER = re.compile(r"Number(?:Int|Long)\(\s*(-?\d+)\s*\)")
+_MONGO_NUMBER_STR = re.compile(r'NumberLong\(\s*"(-?\d+)"\s*\)')
+
+
+def _iter_status_snapshots(path: Path):
+    """Yield snapshot objects from NDJSON or concatenated JSON documents.
+
+    Files through mid-2019 are pretty-printed Mongo shell exports: several
+    documents in one file, with ``NumberInt`` / ``NumberLong`` wrappers.
+    Later months are one JSON object per line.
+    """
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        first = ""
+        while True:
+            line = fh.readline()
+            if line == "":
+                raise RuntimeError(f"{path.name} is empty")
+            if line.strip():
+                first = line
+                break
+        try:
+            obj = json.loads(first)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and "stations" in obj:
+            yield obj
+            for line_no, line in enumerate(fh, start=2):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    nxt = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"{path.name} line {line_no} is not a JSON snapshot") from exc
+                if not isinstance(nxt, dict) or "stations" not in nxt:
+                    raise RuntimeError(f"{path.name} line {line_no} is not a station snapshot")
+                yield nxt
+            return
+    yield from _iter_concatenated_snapshots(path)
+
+
+def _iter_concatenated_snapshots(path: Path):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    text = _MONGO_NUMBER_STR.sub(r"\1", text)
+    text = _MONGO_NUMBER.sub(r"\1", text)
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    found = 0
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"{path.name} could not be parsed as station snapshots at character {index}"
+            ) from exc
+        index = end
+        found += 1
+        if isinstance(obj, dict) and "stations" in obj:
+            yield obj
+            continue
+        if (
+            isinstance(obj, list)
+            and obj
+            and all(isinstance(item, dict) and "id" in item for item in obj)
+        ):
+            yield {"_id": None, "stations": obj}
+            continue
+        raise RuntimeError(f"{path.name} value {found} is not a station snapshot")
+    if found == 0:
+        raise RuntimeError(f"{path.name} contained no station snapshots")
+
+
+def _count_listed_stations(stations, path: Path) -> tuple[int, int | None]:
+    if not isinstance(stations, list):
+        raise RuntimeError(f"{path.name} has a snapshot whose stations field is not a list")
+    by_id: dict[object, bool | None] = {}
+    saw_activate = False
+    for station in stations:
+        if not isinstance(station, dict):
+            continue
+        station_id = station.get("id")
+        if station_id is None:
+            continue
+        flag: bool | None = None
+        if "activate" in station:
+            saw_activate = True
+            flag = _activate_flag(station.get("activate"))
+        by_id[station_id] = flag
+    n_active = sum(1 for flag in by_id.values() if flag) if saw_activate else None
+    return len(by_id), n_active
+
+
+def _activate_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip() == "1"
+    return False

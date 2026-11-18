@@ -257,6 +257,8 @@ Store feature definitions in a configuration file so ablation studies are easy.
 
 **Core stack**: Python 3.10+, Polars or Pandas, PyArrow, scikit-learn, XGBoost, Optuna, Plotly/Matplotlib/Seaborn, Pandera or Great Expectations, optionally Prefect or simple Makefiles for orchestration.
 
+**Databricks**: [docs/databricks.md](docs/databricks.md) stands the same pipeline up on a workspace. Use it for `DATA_SCOPE` `2022` or `all`, with the October 2022 demo as the first run.
+
 ---
 
 This guide is deliberately concrete so you can start coding immediately while keeping every required concept (pipeline design, quality, validation, statistical profiling, EDA, feature engineering, RF/XGBoost/NN, regression + classification, utilization rate) visible and interconnected.

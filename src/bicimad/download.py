@@ -13,6 +13,10 @@ layout ``discover_trip_files`` / ``discover_status_files`` already read.
 - ``all`` — every month the seven yearly archives contain
 
 A month that is already on disk is left untouched.
+
+``ensure_status_files`` is the status-only counterpart used by the
+infrastructure notebook. It fetches station snapshots and leaves trip
+archives on the server.
 """
 
 from __future__ import annotations
@@ -123,6 +127,41 @@ def ensure_raw_data(cfg: ProjectConfig) -> pd.DataFrame:
     if not rows:
         return _frame([])
     return _frame(rows)
+
+
+def ensure_status_files(cfg: ProjectConfig) -> pd.DataFrame:
+    """Download every station-status member of the EMT yearly archives.
+
+    Trip members are not fetched. A status file already on disk is left as it
+    is. A year whose archive contains no status member is one row with action
+    ``not published``.
+    """
+    cfg.status_raw.mkdir(parents=True, exist_ok=True)
+    resources = fetch_year_resources()
+    rows: list[dict] = []
+    seen: dict[str, set[str]] = {"trips": set(), "status": set()}
+    unpublished: list[dict] = []
+    for year in sorted(resources):
+        got = _acquire_year(cfg, year, resources[year], None, seen, kinds={"status"})
+        if not got:
+            print(f"EMT {year}: archive has no station-status files.", flush=True)
+            unpublished.append(
+                {
+                    "year": year,
+                    "month": str(year),
+                    "kind": "status",
+                    "file": "",
+                    "bytes": 0,
+                    "action": "not published",
+                }
+            )
+            continue
+        rows.extend(got)
+    frame = _frame(rows)
+    if not unpublished:
+        return frame
+    extra = pd.DataFrame(unpublished, columns=_REPORT_COLUMNS)
+    return pd.concat([frame, extra], ignore_index=True)
 
 
 def fetch_year_resources() -> dict[int, str]:
@@ -279,6 +318,7 @@ def _acquire_year(
     url: str,
     wanted: set[str] | None,
     seen: dict[str, set[str]],
+    kinds: set[str] | None = None,
 ) -> list[dict]:
     print(f"EMT {year}: listing {url}", flush=True)
     entries = _remote_zip_entries(url)
@@ -289,6 +329,8 @@ def _acquire_year(
             continue
         kind, months = _covered_months(name)
         if kind is None or not months:
+            continue
+        if kinds is not None and kind not in kinds:
             continue
         if wanted is not None:
             months = {month for month in months if month in wanted}
@@ -310,7 +352,7 @@ def _acquire_year(
             inflated = Path(tmp) / "inflated"
             _download_member(url, entry, payload)
             _inflate_member(payload, inflated, entry)
-            placed = _place_file(inflated, name, cfg, wanted, depth=0)
+            placed = _place_file(inflated, name, cfg, wanted, depth=0, kinds=kinds)
             if not placed:
                 raise RuntimeError(f"Unpacked {name} but it contained no trip or status file.")
             rows.extend(placed)
@@ -359,6 +401,7 @@ def _place_file(
     cfg: ProjectConfig,
     wanted: set[str] | None,
     depth: int,
+    kinds: set[str] | None = None,
 ) -> list[dict]:
     if depth > 4:
         raise RuntimeError(f"Archive nesting is deeper than expected at {entry_name}")
@@ -366,12 +409,14 @@ def _place_file(
         return []
     suffix = PurePosixPath(entry_name).suffix.lower()
     if suffix == ".zip" or _looks_like_zip(path):
-        return _place_zip(path, cfg, wanted, depth + 1)
+        return _place_zip(path, cfg, wanted, depth + 1, kinds)
     if suffix == ".rar" or _looks_like_rar(path):
-        return _place_rar(path, entry_name, cfg, wanted, depth + 1)
+        return _place_rar(path, entry_name, cfg, wanted, depth + 1, kinds)
     kind = kind_of(entry_name)
     month = month_of(entry_name)
     if kind is None or month is None:
+        return []
+    if kinds is not None and kind not in kinds:
         return []
     if wanted is not None and month not in wanted:
         return []
@@ -385,13 +430,21 @@ def _place_file(
     return [_row(month, kind, dest.name, dest.stat().st_size, "downloaded")]
 
 
-def _place_zip(path: Path, cfg: ProjectConfig, wanted: set[str] | None, depth: int) -> list[dict]:
+def _place_zip(
+    path: Path,
+    cfg: ProjectConfig,
+    wanted: set[str] | None,
+    depth: int,
+    kinds: set[str] | None = None,
+) -> list[dict]:
     rows: list[dict] = []
     with zipfile.ZipFile(path) as archive:
         for info in archive.infolist():
             if info.is_dir() or is_junk(info.filename):
                 continue
             kind, months = _covered_months(info.filename)
+            if kinds is not None and kind is not None and kind not in kinds:
+                continue
             if (
                 kind is not None
                 and months
@@ -408,7 +461,7 @@ def _place_zip(path: Path, cfg: ProjectConfig, wanted: set[str] | None, depth: i
                 extracted = Path(tmp) / PurePosixPath(info.filename).name
                 with archive.open(info) as src, extracted.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
-                rows.extend(_place_file(extracted, info.filename, cfg, wanted, depth))
+                rows.extend(_place_file(extracted, info.filename, cfg, wanted, depth, kinds))
     return rows
 
 
@@ -418,6 +471,7 @@ def _place_rar(
     cfg: ProjectConfig,
     wanted: set[str] | None,
     depth: int,
+    kinds: set[str] | None = None,
 ) -> list[dict]:
     tar = shutil.which("tar")
     if tar is None:
@@ -440,7 +494,7 @@ def _place_rar(
             detail = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(f"tar could not unpack {PurePosixPath(entry_name).name}: {detail}")
         for file in sorted(p for p in out.rglob("*") if p.is_file()):
-            rows.extend(_place_file(file, file.name, cfg, wanted, depth))
+            rows.extend(_place_file(file, file.name, cfg, wanted, depth, kinds))
     return rows
 
 
