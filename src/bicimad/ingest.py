@@ -581,18 +581,33 @@ def snapshot_docked_bikes(path: Path) -> pd.DataFrame:
     stations marked unavailable. A missing or non-numeric ``dock_bikes``
     counts as zero.
     """
+    frame = _snapshot_station_sum(path, "dock_bikes", "n_docked")
+    return frame
+
+
+def snapshot_dock_capacity(path: Path) -> pd.DataFrame:
+    """One row per status snapshot in ``path``.
+
+    ``n_docks`` sums ``total_bases`` over every listed station, including
+    stations marked unavailable. A missing or non-numeric ``total_bases``
+    counts as zero.
+    """
+    return _snapshot_station_sum(path, "total_bases", "n_docks")
+
+
+def _snapshot_station_sum(path: Path, field: str, column: str) -> pd.DataFrame:
     rows: list[dict] = []
     for obj in _iter_status_snapshots(path):
         rows.append(
             {
                 "ts": _to_utc_datetime(obj.get("_id")),
-                "n_docked": _sum_dock_bikes(obj.get("stations"), path),
+                column: _sum_station_int(obj.get("stations"), path, field),
             }
         )
     if not rows:
         raise RuntimeError(f"{path.name} contained no station snapshots")
     frame = pd.DataFrame(rows)
-    frame["n_docked"] = frame["n_docked"].astype("int64")
+    frame[column] = frame[column].astype("int64")
     frame["ts"] = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
     missing_ts = int(frame["ts"].isna().sum())
     if missing_ts:
@@ -600,13 +615,13 @@ def snapshot_docked_bikes(path: Path) -> pd.DataFrame:
     return frame
 
 
-def _sum_dock_bikes(stations, path: Path) -> int:
+def _sum_station_int(stations, path: Path, field: str) -> int:
     if not isinstance(stations, list):
         raise RuntimeError(f"{path.name} has a snapshot whose stations field is not a list")
     total = 0
     for station in stations:
         if isinstance(station, dict):
-            total += _dock_bikes_value(station.get("dock_bikes"))
+            total += _dock_bikes_value(station.get(field))
     return total
 
 
